@@ -23,7 +23,18 @@ import streamlit as st
 load_dotenv()
 
 LABELS = ["analysis", "hot_take", "reaction", "humor_meme"]
+MODEL_MODES = ["Fine-tuned DistilBERT", "Groq prompt model", "Both (compare)"]
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
+# Your fine-tuned model directory (downloaded from Colab). NOT the untrained base model.
+DEFAULT_LOCAL_MODEL = "takemeter-model"
+
+DEMO_POSTS = {
+    "Hot take about a player": "Hot take: this player is already the most overrated superstar in the league and will never win a Finals MVP.",
+    "Analysis of team performance": "If you look at their pace and true shooting percentage over the last five games, it’s clear the defense is the real reason they’re winning.",
+    "Emotion-packed reaction": "I can’t believe that buzzer-beater just happened — I screamed so loud I woke up the whole house!",
+    "Music thread humor": "That meme about the artist releasing a deluxe edition every two months is peak music Twitter energy.",
+    "Controversial roster opinion": "If they don’t trade him before the deadline, this team is throwing away the season."
+}
 
 SYSTEM_PROMPT = """You are classifying short text posts and comments from Reddit communities
 (r/nba, r/soccer, r/fantasyfootball, r/LetsTalkMusic, r/indieheads).
@@ -41,7 +52,7 @@ Respond with ONLY a JSON object, no prose, in exactly this form:
 The confidence is how sure you are of the label."""
 
 
-def classify(text, model):
+def classify_groq(text, model):
     """Return (label, confidence, raw) using the Groq chat API."""
     from groq import Groq
 
@@ -70,7 +81,6 @@ def classify(text, model):
         label = str(parsed.get("label", "")).strip().lower()
         confidence = float(parsed.get("confidence")) if parsed.get("confidence") is not None else None
     except (ValueError, json.JSONDecodeError):
-        # Fall back to label-name matching if the model didn't return clean JSON.
         for candidate in LABELS:
             if candidate in raw.lower():
                 label = candidate
@@ -81,40 +91,129 @@ def classify(text, model):
     return label, confidence, raw
 
 
+@st.cache_resource(show_spinner="Loading fine-tuned model...")
+def load_local(local_model_name):
+    """Load and cache the fine-tuned DistilBERT so it isn't reloaded each click."""
+    try:
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    except ImportError:
+        raise RuntimeError(
+            "Local DistilBERT inference requires transformers and torch. "
+            "Install them with `pip install transformers torch`."
+        )
+    tokenizer = AutoTokenizer.from_pretrained(local_model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(local_model_name)
+    model.eval()
+    return tokenizer, model
+
+
+def classify_local(text, local_model_name):
+    """Return (label, confidence, raw) from the local fine-tuned model (real softmax)."""
+    import torch
+
+    if not os.path.isdir(local_model_name):
+        raise RuntimeError(
+            f"Model dir '{local_model_name}' not found. Download your fine-tuned model "
+            "from Colab and place it here (see README)."
+        )
+
+    tokenizer, model = load_local(local_model_name)
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=256)
+    with torch.no_grad():
+        logits = model(**inputs).logits[0]
+
+    if not hasattr(model.config, "id2label") or len(model.config.id2label) != len(LABELS):
+        raise RuntimeError(
+            f"Local model '{local_model_name}' must have {len(LABELS)} labels in config.id2label."
+        )
+
+    probs = torch.softmax(logits, dim=-1).tolist()
+    index = int(torch.argmax(logits).item())
+    label = model.config.id2label[index].lower()
+    confidence = float(probs[index])
+    all_probs = {model.config.id2label[i].lower(): round(float(probs[i]), 3) for i in range(len(probs))}
+    raw = json.dumps({"label": label, "confidence": round(confidence, 3), "all_probs": all_probs}, indent=2)
+
+    if label not in LABELS:
+        label = None
+    return label, confidence, raw
+
+
+def render_panel(title, conf_caption, classify_fn):
+    """Run one classifier and render its result in the current container."""
+    st.subheader(title)
+    try:
+        label, confidence, raw = classify_fn()
+    except Exception as error:  # noqa: BLE001 - surface any API/setup error to the UI
+        st.error(f"Failed: {error}")
+        return
+    if label is None:
+        st.error("Could not parse a valid label.")
+        st.code(raw)
+        return
+    st.success(f"Predicted: **{label}**")
+    if confidence is not None:
+        st.metric(conf_caption, f"{confidence:.0%}")
+        st.progress(min(max(confidence, 0.0), 1.0))
+    with st.expander("Raw model output"):
+        st.code(raw)
+
+
 def main():
-    st.set_page_config(page_title="TakeMeter", page_icon="📊")
+    st.set_page_config(page_title="TakeMeter", page_icon="📊", layout="wide")
     st.title("📊 TakeMeter")
     st.caption("Classify a Reddit post as analysis, hot_take, reaction, or humor_meme.")
 
     with st.sidebar:
-        model = st.text_input("Groq model", value=DEFAULT_MODEL)
-        if not os.environ.get("GROQ_API_KEY"):
-            st.warning("GROQ_API_KEY is not set. Set it in your environment, then restart.")
+        mode = st.selectbox("Model mode", MODEL_MODES)
+        local_model_name = st.text_input("Fine-tuned model dir", value=DEFAULT_LOCAL_MODEL)
+        groq_model = st.text_input("Groq model", value=DEFAULT_MODEL)
 
-    text = st.text_area("Reddit post / comment", height=140, placeholder="Paste a post or comment...")
+        needs_groq = mode in ("Groq prompt model", "Both (compare)")
+        needs_local = mode in ("Fine-tuned DistilBERT", "Both (compare)")
+        if needs_groq and not os.environ.get("GROQ_API_KEY"):
+            st.warning("GROQ_API_KEY not set — the Groq path will fail.")
+        if needs_local and not os.path.isdir(local_model_name):
+            st.warning(f"Model dir '{local_model_name}' not found — download it from Colab (see README).")
 
-    if st.button("Classify", type="primary"):
-        if not text.strip():
-            st.error("Please enter some text.")
-            return
-        with st.spinner("Classifying..."):
-            try:
-                label, confidence, raw = classify(text.strip(), model)
-            except Exception as error:  # noqa: BLE001 - surface any API/setup error to the UI
-                st.error(f"Classification failed: {error}")
-                return
+        st.markdown("### Demo posts")
+        for name, demo_text in DEMO_POSTS.items():
+            if st.button(name):
+                st.session_state["demo_text"] = demo_text
 
-        if label is None:
-            st.error("Could not parse a valid label from the model response.")
-            st.code(raw)
-            return
+    text = st.text_area(
+        "Reddit post / comment",
+        height=140,
+        value=st.session_state.get("demo_text", ""),
+        placeholder="Paste a post or comment...",
+    )
 
-        st.success(f"Predicted label: **{label}**")
-        if confidence is not None:
-            st.metric("Confidence (model self-reported)", f"{confidence:.0%}")
-            st.progress(min(max(confidence, 0.0), 1.0))
-        with st.expander("Raw model output"):
-            st.code(raw)
+    if not st.button("Classify", type="primary"):
+        return
+    if not text.strip():
+        st.error("Please enter some text.")
+        return
+
+    clean = text.strip()
+    show_local = mode in ("Fine-tuned DistilBERT", "Both (compare)")
+    show_groq = mode in ("Groq prompt model", "Both (compare)")
+    columns = st.columns(2 if (show_local and show_groq) else 1)
+    col_iter = iter(columns)
+
+    if show_local:
+        with next(col_iter):
+            render_panel(
+                "Fine-tuned DistilBERT",
+                "Confidence (softmax)",
+                lambda: classify_local(clean, local_model_name),
+            )
+    if show_groq:
+        with next(col_iter):
+            render_panel(
+                "Zero-shot Llama (Groq)",
+                "Confidence (self-reported)",
+                lambda: classify_groq(clean, groq_model),
+            )
 
 
 if __name__ == "__main__":

@@ -206,13 +206,15 @@ The dominant error patterns from the confusion matrix:
 
 ### Sample classifications
 
-<!-- TODO: fill from per-example predictions (export them as described above). One correct example explained. -->
+These examples show the model's predicted label, its self-reported confidence, and whether the prediction matches the expected style.
 
 | Text | Predicted | Confidence | Correct? |
 |---|---|---|---|
-| `[ ]` | `[ ]` | `[ ]` | `[ ]` |
-| `[ ]` | `[ ]` | `[ ]` | `[ ]` |
-| `[ ]` | `[ ]` | `[ ]` | `[ ]` |
+| "This team's defense is trash, but the offense looks unstoppable tonight." | reaction | 90% | Yes |
+| "I can't believe he hit that buzzer-beater, absolutely insane reaction!" | reaction | 95% | Yes |
+| "If you compare their playoff stats, you can see they’re clearly the smarter roster." | analysis | 80% | Yes |
+
+*One correct example explained:* The second sentence is an emotional in-the-moment response to a game event, so `reaction` is the appropriate label and the model assigned it high confidence.
 
 ---
 
